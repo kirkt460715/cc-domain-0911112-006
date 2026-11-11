@@ -5,6 +5,7 @@ from .books.controls import Controls
 from .books.periods import Periods
 from .importers.documents import DocumentImporter
 from .importers.bank import BankEvidence
+from .importers.bank_statements import BankStatements
 from .matching.planner import Matcher
 from .reporting.aging import Aging
 from .reporting.statements import Statements
@@ -24,6 +25,7 @@ class Workbench:
         self.ledger = Ledger(self.db)
         self.documents = DocumentImporter(self.db, self.ledger)
         self.bank = BankEvidence(self.db, self.ledger)
+        self.statement_adapters = BankStatements(self.db, self.bank)
         self.matching = Matcher(self.db, self.ledger)
         self.disputes = Disputes(self.db, self.ledger)
         self.aging = Aging(self.db, self.ledger)
@@ -65,6 +67,7 @@ class Workbench:
             "bank.link": self.bank.link,
             "bank.unlink": self.bank.unlink,
             "bank.unmatched": self.bank.unmatched,
+            "bank.outgoing": self.bank.outgoing,
             "bank.reconcile": self.bank.reconcile,
             "matching.candidates": self.matching.candidates,
             "matching.propose": self.matching.propose,
@@ -99,6 +102,10 @@ class Workbench:
             ("trace", self.trace, ["document", "provenance", "allocation_graph", "audit_page"]),
             ("inbox", self.inbox, ["stage", "get", "inspect", "approve", "commit", "reject", "pending"]),
             ("profile", self.profiles, ["save", "get", "preview", "apply"]),
+            ("bank_adapter", self.statement_adapters,
+             ["save_adapter", "get_adapter"]),
+            ("bank_statement", self.statement_adapters,
+             ["stage", "get", "preview", "confirm", "reject", "pending"]),
             ("subset", self.subsets, ["search", "propose"]),
             ("confirmation", self.confirmations, ["submit", "get", "reconcile", "decide", "close"]),
             ("delivery", self.delivery, ["register", "status", "lease", "release", "prepare", "get", "resume", "acknowledge", "verify_checkpoint", "envelope", "verify_envelope"]),

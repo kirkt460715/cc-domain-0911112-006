@@ -142,7 +142,8 @@ class CollectionQueue:
             elif self.ledger.balance(plan["source"]) != plan["source_baseline"]:
                 result.append({"type": "stale_plan", "id": row["id"]})
         for row in self.db.rows(
-            "SELECT b.id,b.booked FROM bank_lines b LEFT JOIN bank_links l ON l.line=b.id WHERE l.line IS NULL AND b.booked<=? ORDER BY b.id",
+            "SELECT b.id,b.booked FROM bank_lines b LEFT JOIN bank_links l ON l.line=b.id "
+            "WHERE l.line IS NULL AND b.direction='credit' AND b.booked<=? ORDER BY b.id",
             (cutoff,),
         ):
             result.append(

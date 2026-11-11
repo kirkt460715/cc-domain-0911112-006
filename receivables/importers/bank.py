@@ -15,14 +15,38 @@ class BankEvidence:
     def __init__(self, database, ledger):
         self.db = database
         self.ledger = ledger
+        self._ensure_direction_column()
+
+    def _ensure_direction_column(self):
+        """Gentle migration for stores that only held positive inbound lines."""
+        columns = {
+            row["name"]
+            for row in self.db.rows("PRAGMA table_info(bank_lines)")
+        }
+        if "direction" not in columns:
+            self.db.connection.executescript(
+                "ALTER TABLE bank_lines ADD COLUMN direction TEXT NOT NULL DEFAULT 'credit'"
+            )
 
     def add(self, data):
-        fields = {"id", "account", "currency", "amount", "booked", "reference", "payer"}
-        obj(data, fields, fields)
+        fields = {
+            "id",
+            "account",
+            "currency",
+            "amount",
+            "booked",
+            "reference",
+            "payer",
+            "direction",
+        }
+        obj(data, fields, {"id", "account", "currency", "amount", "booked", "reference", "payer"})
         ident = identifier(data["id"])
         code = currency(data["currency"])
         amount = money(data["amount"], code)
         booked = day(data["booked"])
+        direction = data.get("direction", "credit")
+        if direction not in {"credit", "debit"}:
+            error("input", "direction must be credit or debit")
         for field in ("reference", "payer"):
             if not isinstance(data[field], str) or len(data[field]) > 512:
                 error("input", "bank reference and payer must be bounded text")
@@ -31,15 +55,32 @@ class BankEvidence:
             "amount": display(amount, code),
             "booked": booked,
             "account": identifier(data["account"]),
+            "direction": direction,
         }
         with self.db.transaction() as con:
-            old = self.db.one("SELECT digest FROM bank_lines WHERE id=?", (ident,))
+            old = self.db.one("SELECT * FROM bank_lines WHERE id=?", (ident,))
             if old:
-                if old["digest"] != digest(payload):
+                # Legacy rows were recorded before direction existed: an inbound
+                # replay without the field must remain exactly compatible.
+                old_direction = old["direction"] if "direction" in old.keys() else "credit"
+                if old["digest"] != digest(payload) and not (
+                    "direction" not in data
+                    and old_direction == "credit"
+                    and digest({k: v for k, v in payload.items() if k != "direction"})
+                    == old["digest"]
+                ):
                     error("conflict", "bank line identity differs")
-                return {"id": ident, "existing": True}
+                if "direction" not in data and old_direction == "credit":
+                    con.execute(
+                        "UPDATE bank_lines SET payload=?,digest=? WHERE id=?",
+                        (canonical(payload), digest(payload), ident),
+                    )
+                    self.db.audit(
+                        "bank_line_direction_normalized", ident, {"direction": "credit"}
+                    )
+                return {"id": ident, "existing": True, "direction": old_direction}
             con.execute(
-                "INSERT INTO bank_lines VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO bank_lines VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     ident,
                     payload["account"],
@@ -50,10 +91,11 @@ class BankEvidence:
                     data["payer"],
                     canonical(payload),
                     digest(payload),
+                    direction,
                 ),
             )
             self.db.audit("bank_line_added", ident, payload)
-        return {"id": ident, "existing": False}
+        return {"id": ident, "existing": False, "direction": direction}
 
     def line(self, line_id):
         row = self.db.one("SELECT * FROM bank_lines WHERE id=?", (line_id,))
@@ -65,6 +107,15 @@ class BankEvidence:
         from datetime import date
 
         line = self.line(line_id)
+        if line["direction"] == "debit":
+            # Outgoing payments never enter the receipt-clearing candidate set.
+            return {
+                "line": line_id,
+                "candidates": [],
+                "ambiguous": False,
+                "already_linked": False,
+                "excluded": "debit_line_is_not_receipt",
+            }
         if self.db.one("SELECT line FROM bank_links WHERE line=?", (line_id,)):
             return {"line": line_id, "candidates": [], "already_linked": True}
         result = []
@@ -122,6 +173,8 @@ class BankEvidence:
         identifier(operator)
         with self.db.transaction() as con:
             line = self.line(line_id)
+            if line["direction"] == "debit":
+                error("bank", "debit bank lines cannot be linked as receipts")
             payment = self.ledger.document(payment_id)
             if (
                 payment["kind"] != "payment"
@@ -168,7 +221,14 @@ class BankEvidence:
 
     def unmatched(self, account=None):
         rows = self.db.rows(
-            "SELECT b.* FROM bank_lines b LEFT JOIN bank_links l ON l.line=b.id WHERE l.line IS NULL ORDER BY b.booked,b.id"
+            "SELECT b.* FROM bank_lines b LEFT JOIN bank_links l ON l.line=b.id "
+            "WHERE l.line IS NULL AND b.direction='credit' ORDER BY b.booked,b.id"
+        )
+        return [row for row in rows if account is None or row["account"] == account]
+
+    def outgoing(self, account=None):
+        rows = self.db.rows(
+            "SELECT * FROM bank_lines WHERE direction='debit' ORDER BY booked,id"
         )
         return [row for row in rows if account is None or row["account"] == account]
 
@@ -182,10 +242,25 @@ class BankEvidence:
             (account, start, end),
         ):
             values = groups.setdefault(
-                line["currency"], {"total": 0, "linked": 0, "unmatched": 0, "lines": 0}
+                line["currency"],
+                {
+                    "total": 0,
+                    "inflow": 0,
+                    "outflow": 0,
+                    "linked": 0,
+                    "unmatched": 0,
+                    "lines": 0,
+                    "debit_lines": 0,
+                },
             )
-            values["total"] += line["amount"]
             values["lines"] += 1
+            if line["direction"] == "debit":
+                values["outflow"] += line["amount"]
+                values["debit_lines"] += 1
+                continue
+            values["inflow"] += line["amount"]
+            # "total" keeps the historical inbound-only semantics for old readers.
+            values["total"] += line["amount"]
             linked = self.db.one(
                 "SELECT payment FROM bank_links WHERE line=?", (line["id"],)
             )
@@ -196,7 +271,9 @@ class BankEvidence:
             "end": end,
             "currencies": {
                 code: {
-                    key: display(value, code) if key != "lines" else value
+                    key: display(value, code)
+                    if key not in ("lines", "debit_lines")
+                    else value
                     for key, value in values.items()
                 }
                 for code, values in groups.items()

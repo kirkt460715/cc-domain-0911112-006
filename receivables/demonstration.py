@@ -44,6 +44,67 @@ def run():
                 }
             )
             work.bank.link("bank1", "pay", "reviewer")
+            statement_html = (
+                '<html><meta charset="utf-8"><table id="statement">'
+                '<tr><th rowspan="2">流水号</th><th rowspan="2">日期</th>'
+                '<th colspan="2">发生额</th><th rowspan="2">币种</th></tr>'
+                '<tr><th>借方</th><th>贷方</th></tr>'
+                '<tr><td>WEB-1</td><td>2026-01-11</td><td></td>'
+                '<td>150.00</td><td>CNY</td></tr>'
+                '<tr class="memo"><td colspan="5">付款人：Instrument Factory；附言：LOCAL-001</td></tr>'
+                '<tr><td>WEB-2</td><td>2026-01-12</td><td>8.00</td>'
+                '<td></td><td>CNY</td></tr>'
+                '<tr class="total"><td colspan="3">合计</td><td>142.00</td><td>CNY</td></tr>'
+                "</table></html>"
+            )
+            work.statement_adapters.save_adapter(
+                "portal",
+                {
+                    "table_id": "statement",
+                    "mapping": {
+                        "id": "流水号",
+                        "booked": "日期",
+                        "debit": "发生额 / 借方",
+                        "credit": "发生额 / 贷方",
+                        "currency": "币种",
+                    },
+                    "date_formats": ["%Y-%m-%d"],
+                    "skip_classes": ["total"],
+                    "skip_patterns": [r"期初余额", r"分页"],
+                    "memo": {
+                        "continuation_classes": ["memo"],
+                        "patterns": [
+                            {"field": "payer", "pattern": r"付款人：(?P<value>[^；]+)"},
+                            {"field": "reference", "pattern": r"附言：(?P<value>[^；\s]+)"},
+                        ],
+                    },
+                },
+            )
+            work.statement_adapters.stage(
+                "web-jan", "portal", "cash", "portal", content=statement_html
+            )
+            web_preview = work.statement_adapters.preview("web-jan")
+            assert not web_preview["quarantine"]
+            assert [line["direction"] for line in web_preview["lines"]] == [
+                "credit",
+                "debit",
+            ]
+            confirmed = work.statement_adapters.confirm(
+                "web-jan", 1, web_preview["review_digest"], "reviewer"
+            )
+            assert confirmed["result"]["inserted"] == 2
+            inbound = work.bank.line("portal:cash:WEB-1")
+            assert inbound["reference"] == "LOCAL-001"
+            assert work.bank.candidates("portal:cash:WEB-2")["candidates"] == []
+            # Re-delivering the same statement never books the flow twice.
+            work.statement_adapters.stage(
+                "web-jan-copy", "portal", "cash", "portal", content=statement_html
+            )
+            replay_preview = work.statement_adapters.preview("web-jan-copy")
+            assert all(line["status"] == "existing" for line in replay_preview["lines"])
+            work.statement_adapters.confirm(
+                "web-jan-copy", 1, replay_preview["review_digest"], "reviewer"
+            )
             work.periods.create("feb", "2026-02-01", "2026-03-01")
             preview = work.periods.preview("feb")
             work.periods.close("feb", preview["digest"], "controller")
